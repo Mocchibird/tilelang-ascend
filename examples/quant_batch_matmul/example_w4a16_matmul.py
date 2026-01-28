@@ -106,7 +106,7 @@ def w4a16_matmul(
     Inside the kernel:
     1. Load A into L1 (cube memory)
     2. Load packed B into UB (vector memory)
-    3. Dequantize B from int4 to fp16 on vector core
+    3. Dequantize B from int4 to fp16 on vector core using tile operations
     4. Copy dequantized B to L1
     5. Perform GEMM on cube core with float32 accumulation
     6. Output C in float16
@@ -144,7 +144,13 @@ def w4a16_matmul(
             C_L0 = T.alloc_L0C([block_M, block_N], accum_dtype)
 
             # UB (Unified Buffer) for vector operations - dequantization
+            # Use int16 for intermediate operations for better hardware compatibility with tile operations
             B_packed_ub = T.alloc_ub([block_K, block_N_packed], "int8")
+            B_packed_i16_ub = T.alloc_ub([block_K, block_N_packed], "int16")
+            B_low_i16_ub = T.alloc_ub([block_K, block_N_packed], "int16")
+            B_high_i16_ub = T.alloc_ub([block_K, block_N_packed], "int16")
+            B_low_fp16_ub = T.alloc_ub([block_K, block_N_packed], dtype)
+            B_high_fp16_ub = T.alloc_ub([block_K, block_N_packed], dtype)
             B_unpacked_ub = T.alloc_ub([block_K, block_N], dtype)
 
             # UB for output processing
@@ -160,16 +166,22 @@ def w4a16_matmul(
                 T.copy(B_packed[bk * block_K, bn * block_N_packed], B_packed_ub)
 
                 # Step 3: Dequantize int4 weights to fp16 on vector core
-                # Unpack: each int8 contains 2 int4 values
-                # Low 4 bits -> first value, high 4 bits -> second value
+                # Cast int8 to int16 for arithmetic operations
+                T.tile.cast(B_packed_i16_ub, B_packed_ub, mode=CAST_MODE, count=block_K * block_N_packed)
+
+                # Extract low and high 4 bits: (val & 0x0F) - 8 and ((val >> 4) & 0x0F) - 8
                 for ki, ni in T.Parallel(block_K, block_N_packed):
-                    # Extract low 4 bits and convert to fp16 (shift from [0,15] to [-8,7])
-                    low_val = ((B_packed_ub[ki, ni].astype("int16") & 0x0F) - 8).astype(dtype)
-                    # Extract high 4 bits and convert to fp16
-                    high_val = (((B_packed_ub[ki, ni].astype("int16") >> 4) & 0x0F) - 8).astype(dtype)
-                    # Store unpacked values
-                    B_unpacked_ub[ki, ni * 2] = low_val
-                    B_unpacked_ub[ki, ni * 2 + 1] = high_val
+                    B_low_i16_ub[ki, ni] = (B_packed_i16_ub[ki, ni] & 0x0F) - 8
+                    B_high_i16_ub[ki, ni] = ((B_packed_i16_ub[ki, ni] >> 4) & 0x0F) - 8
+
+                # Cast int16 to fp16
+                T.tile.cast(B_low_fp16_ub, B_low_i16_ub, mode=CAST_MODE, count=block_K * block_N_packed)
+                T.tile.cast(B_high_fp16_ub, B_high_i16_ub, mode=CAST_MODE, count=block_K * block_N_packed)
+
+                # Interleave low and high values to create unpacked buffer
+                for ki, ni in T.Parallel(block_K, block_N_packed):
+                    B_unpacked_ub[ki, ni * 2] = B_low_fp16_ub[ki, ni]
+                    B_unpacked_ub[ki, ni * 2 + 1] = B_high_fp16_ub[ki, ni]
 
                 # Step 4: Copy dequantized weights from UB to L1 (cube memory)
                 T.copy(B_unpacked_ub, B_L1)
