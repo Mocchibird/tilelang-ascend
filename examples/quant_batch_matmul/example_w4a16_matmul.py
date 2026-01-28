@@ -5,7 +5,7 @@ This example demonstrates a W4A16 (4-bit weights, 16-bit activations) quantized 
 kernel for Ascend NPU 910B.
 
 The workflow:
-1. Create a weight matrix in fp16 but restricted to int4 range (-8, 7)
+1. Create a weight matrix in fp16 but restricted to int4 range [-8, 7] (inclusive)
 2. Create an activation matrix in fp16 (random)
 3. Pack the int4 weights into int8 storage (2 int4 values per int8)
 4. Ascend NPU Kernel:
@@ -129,7 +129,7 @@ def w4a16_matmul(
             A: T.Tensor([M, K], dtype),              # Activation matrix in fp16
             B_packed: T.Tensor([K, N_packed], "int8"),  # Packed int4 weights
             C: T.Tensor([M, N], dtype),              # Output matrix in fp16
-            workspace: T.Tensor([M, N], accum_dtype),  # Workspace for L0C output
+            workspace: T.Tensor([M, N], accum_dtype),  # Intermediate buffer for L0C -> UB transfer
     ):
         with T.Kernel(m_num * n_num, is_npu=True) as (cid, vid):
             # Calculate block indices
@@ -217,7 +217,18 @@ def check_case(
 ):
     """
     Test case for W4A16 matmul.
+
+    Requirements:
+    - M must be divisible by block_M
+    - N must be even (for int4 packing) and divisible by block_N
+    - K must be divisible by block_K
     """
+    # Validate dimension requirements
+    assert N % 2 == 0, "N must be even for int4 packing (2 int4 values per int8)"
+    assert M % block_M == 0, f"M ({M}) must be divisible by block_M ({block_M})"
+    assert N % block_N == 0, f"N ({N}) must be divisible by block_N ({block_N})"
+    assert K % block_K == 0, f"K ({K}) must be divisible by block_K ({block_K})"
+
     # Create activation matrix in fp16 (random values)
     A = torch.randn([M, K], dtype=torch.float16)
 
@@ -264,3 +275,4 @@ def main(custom_args=None):
 
 if __name__ == "__main__":
     main()
+
