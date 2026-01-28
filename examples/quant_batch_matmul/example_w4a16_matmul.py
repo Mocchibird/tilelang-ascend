@@ -33,6 +33,10 @@ def pack_int4_to_int8(weight_int4: torch.Tensor) -> torch.Tensor:
     """
     Pack two int4 values into one int8 value.
 
+    The packing format stores:
+    - First int4 value in low nibble (bits 0-3)
+    - Second int4 value in high nibble (bits 4-7)
+
     Args:
         weight_int4: Weight tensor with int4 values in int8 dtype, shape [..., N]
                     N must be even (we pack pairs of values)
@@ -49,7 +53,7 @@ def pack_int4_to_int8(weight_int4: torch.Tensor) -> torch.Tensor:
     # Convert to unsigned for packing (shift from [-8,7] to [0,15])
     weight_unsigned = (weight_pairs + 8).to(torch.uint8)
 
-    # Pack: low 4 bits from first element, high 4 bits from second element
+    # Pack: low nibble from first element, high nibble from second element
     packed = (weight_unsigned[..., 0] & 0x0F) | ((weight_unsigned[..., 1] & 0x0F) << 4)
 
     return packed.to(torch.int8)
@@ -59,24 +63,31 @@ def unpack_int8_to_int4_fp16(packed: torch.Tensor) -> torch.Tensor:
     """
     Unpack int8 to two int4 values and convert to fp16.
 
+    The unpacking format expects:
+    - First int4 value in low nibble (bits 0-3)
+    - Second int4 value in high nibble (bits 4-7)
+
+    The packed values are stored as unsigned [0, 15] (original signed [-8, 7] + 8).
+    This function converts back by subtracting 8.
+
     Args:
         packed: Packed tensor with shape [..., N] in int8 dtype
 
     Returns:
         Unpacked tensor with shape [..., N*2] in fp16 dtype
     """
-    # Extract low and high 4 bits
+    # Extract low and high 4 bits as unsigned values [0-15]
     packed_uint = packed.to(torch.uint8)
-    low = (packed_uint & 0x0F).to(torch.int8)
-    high = ((packed_uint >> 4) & 0x0F).to(torch.int8)
+    lo = (packed_uint & 0x0F).to(torch.int32)
+    hi = ((packed_uint >> 4) & 0x0F).to(torch.int32)
 
-    # Convert back from unsigned [0,15] to signed [-8,7]
-    low = low.to(torch.int16) - 8
-    high = high.to(torch.int16) - 8
+    # Convert from unsigned [0, 15] back to signed [-8, 7] by subtracting 8
+    lo_s = lo - 8
+    hi_s = hi - 8
 
-    # Interleave and convert to fp16
+    # Interleave: low nibble first, high nibble second (to match kernel order)
     shape = packed.shape
-    unpacked = torch.stack([low, high], dim=-1).view(*shape[:-1], shape[-1] * 2)
+    unpacked = torch.stack([lo_s, hi_s], dim=-1).view(*shape[:-1], shape[-1] * 2)
 
     return unpacked.to(torch.float16)
 
@@ -106,10 +117,15 @@ def w4a16_matmul(
     Inside the kernel:
     1. Load A into L1 (cube memory)
     2. Load packed B into UB (vector memory)
-    3. Dequantize B from int4 to fp16 on vector core using tile operations
+    3. Dequantize B from int4 to fp16 on vector core using TIR intrinsics
     4. Copy dequantized B to L1
     5. Perform GEMM on cube core with float32 accumulation
     6. Output C in float16
+
+    The int4 unpacking converts from unsigned [0, 15] back to signed [-8, 7]:
+    - Extract low/high nibbles using bitwise operations
+    - Subtract 8 to convert back to signed range
+    - Cast to target dtype
     """
 
     VEC_NUM = 2  # Number of vector units per cube core
@@ -144,13 +160,8 @@ def w4a16_matmul(
             C_L0 = T.alloc_L0C([block_M, block_N], accum_dtype)
 
             # UB (Unified Buffer) for vector operations - dequantization
-            # Use int16 for intermediate operations for better hardware compatibility with tile operations
             B_packed_ub = T.alloc_ub([block_K, block_N_packed], "int8")
-            B_packed_i16_ub = T.alloc_ub([block_K, block_N_packed], "int16")
-            B_low_i16_ub = T.alloc_ub([block_K, block_N_packed], "int16")
-            B_high_i16_ub = T.alloc_ub([block_K, block_N_packed], "int16")
-            B_low_fp16_ub = T.alloc_ub([block_K, block_N_packed], dtype)
-            B_high_fp16_ub = T.alloc_ub([block_K, block_N_packed], dtype)
+            B_unpacked_i8_ub = T.alloc_ub([block_K, block_N], "int8")
             B_unpacked_ub = T.alloc_ub([block_K, block_N], dtype)
 
             # UB for output processing
@@ -165,23 +176,32 @@ def w4a16_matmul(
                 # Step 2: Load packed weights to UB (vector memory)
                 T.copy(B_packed[bk * block_K, bn * block_N_packed], B_packed_ub)
 
-                # Step 3: Dequantize int4 weights to fp16 on vector core
-                # Cast int8 to int16 for arithmetic operations
-                T.tile.cast(B_packed_i16_ub, B_packed_ub, mode=CAST_MODE, count=block_K * block_N_packed)
+                # Step 3: Dequantize int4 weights using TIR intrinsics
+                # Use T.Scope("V") for explicit vector core operations
+                with T.Scope("V"):
+                    T.barrier_all()
+                    # Unpack int4 values from packed int8
+                    # Each int8 contains 2 int4 values: low nibble and high nibble
+                    # Values are stored as unsigned [0, 15], need to convert back to signed [-8, 7]
+                    for ki in T.serial(block_K):
+                        for ni in T.serial(block_N_packed):
+                            # Cast to int32 for safe bit manipulation, mask to unsigned byte
+                            p = T.bitwise_and(T.cast(B_packed_ub[ki, ni], "int32"), 255)
+                            # Extract low and high nibbles (unsigned [0-15])
+                            lo = T.bitwise_and(p, 15)
+                            hi = T.bitwise_and(T.shift_right(p, 4), 15)
 
-                # Extract low and high 4 bits: (val & 0x0F) - 8 and ((val >> 4) & 0x0F) - 8
-                for ki, ni in T.Parallel(block_K, block_N_packed):
-                    B_low_i16_ub[ki, ni] = (B_packed_i16_ub[ki, ni] & 0x0F) - 8
-                    B_high_i16_ub[ki, ni] = ((B_packed_i16_ub[ki, ni] >> 4) & 0x0F) - 8
+                            # Convert from unsigned [0, 15] to signed [-8, 7] by subtracting 8
+                            lo_s = lo - 8
+                            hi_s = hi - 8
 
-                # Cast int16 to fp16
-                T.tile.cast(B_low_fp16_ub, B_low_i16_ub, mode=CAST_MODE, count=block_K * block_N_packed)
-                T.tile.cast(B_high_fp16_ub, B_high_i16_ub, mode=CAST_MODE, count=block_K * block_N_packed)
+                            # Store unpacked values (low nibble first, high nibble second)
+                            B_unpacked_i8_ub[ki, ni * 2] = T.cast(lo_s, "int8")
+                            B_unpacked_i8_ub[ki, ni * 2 + 1] = T.cast(hi_s, "int8")
+                    T.barrier_all()
 
-                # Interleave low and high values to create unpacked buffer
-                for ki, ni in T.Parallel(block_K, block_N_packed):
-                    B_unpacked_ub[ki, ni * 2] = B_low_fp16_ub[ki, ni]
-                    B_unpacked_ub[ki, ni * 2 + 1] = B_high_fp16_ub[ki, ni]
+                # Cast unpacked int8 to fp16
+                T.tile.cast(B_unpacked_ub, B_unpacked_i8_ub, mode=CAST_MODE, count=block_K * block_N)
 
                 # Step 4: Copy dequantized weights from UB to L1 (cube memory)
                 T.copy(B_unpacked_ub, B_L1)
